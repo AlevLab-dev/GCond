@@ -73,10 +73,12 @@ class GradientConductor:
         use_lion: bool = True,              # Enables Lion-style update
         trust_ratio_coef: float = 0.004,    # LARS/LAMB trust ratio coefficient
         dominance_window: int = 3,
-        conflict_thresholds: Tuple[float, float, float] = (-0.75, -0.5, 0), # (critical, main, weak) thresholds
+        conflict_thresholds: Tuple[float, float, float] = (-0.85, -0.5, 0), # (critical, main, weak) thresholds
         norm_ema_beta: float = 0.95,
         tie_breaking_weights: Tuple[float, float] = (0.8, 0.2), # (stability, strength) - Tie-breaking weights
         return_raw_grad: bool = False,
+        remap_power: float = 2.0,           # Power for non-linear angle remapping
+        use_smooth_logic: bool = True,      # Use the new smooth conflict resolution
         ddp_sync: Literal["avg", "broadcast", "none"] = "avg",
         freeze_bn: bool = True,
         eps: float = 1e-8,
@@ -105,11 +107,15 @@ class GradientConductor:
 
         self.beta = float(momentum_beta)
         self.use_lion = bool(use_lion)
-        # Stores the scaled update for Lion/SGD
-        self._out_update: Optional[GradList] = None
+        
         if trust_ratio_coef <= 0:
             raise ValueError("trust_ratio_coef must be > 0")
         self.trust_ratio_coef = float(trust_ratio_coef)
+
+        if remap_power <= 0:
+            raise ValueError("remap_power must be positive.")
+        self.remap_power = float(remap_power)
+        self.use_smooth_logic = bool(use_smooth_logic)
     
         if not (0.0 <= norm_ema_beta < 1.0):
             raise ValueError("norm_ema_beta must be in [0, 1).")
@@ -119,6 +125,7 @@ class GradientConductor:
             raise ValueError("dominance_window must be non-negative.")
         self.dominance_window = dominance_window
         
+        self.conflict_thresholds = conflict_thresholds
         # --- Validate conflict_thresholds ---
         if len(self.conflict_thresholds) != 3:
             raise ValueError("conflict_thresholds must be a tuple of 3 floats.")
@@ -136,7 +143,7 @@ class GradientConductor:
                     f"Threshold at index {i} ({th}) is outside the valid "
                     f"cosine similarity range of [-1.0, 1.0]."
                 )
-        self.conflict_thresholds = conflict_thresholds
+        
         
         if not (len(tie_breaking_weights) == 2 and sum(tie_breaking_weights) > 0):
             raise ValueError("tie_breaking_weights must be a tuple of 2 non-negative numbers with a positive sum.")
@@ -157,6 +164,7 @@ class GradientConductor:
         )
 
         # --- Parameter & State Buffers ---
+
         self.grad_params: List[nn.Parameter] = [
             p for p in self.model.parameters() if p.requires_grad
         ]
@@ -165,11 +173,15 @@ class GradientConductor:
         self.device = self.grad_params[0].device
 
         self.accumulators: Dict[str, GradList] = {
-            k: [torch.zeros_like(p, dtype=torch.float32) for p in self.grad_params]
+            k: [torch.zeros_like(p, dtype=torch.bfloat16) for p in self.grad_params]
             for k in self.loss_fns
         }
         self.momentum: GradList = [
-            torch.zeros_like(p, dtype=torch.float32) for p in self.grad_params
+            torch.zeros_like(p, dtype=torch.bfloat16) for p in self.grad_params
+        ]
+        # Buffer for the final gradient update after momentum and trust-ratio scaling
+        self.final_update: GradList = [
+            torch.zeros_like(p, dtype=torch.bfloat16) for p in self.grad_params
         ]
         # Buffer for the projected gradient before the momentum update
         self._last_safe: Optional[GradList] = None
@@ -177,9 +189,11 @@ class GradientConductor:
         # --- State for the Adaptive Arbitrator ---
         # History of "winners" to track dominance
         self.projection_history: deque[str] = deque(maxlen=self.dominance_window)
+
         # Previous gradients for stability calculation (in float16 to save memory)
-        self.prev_accumulators: Dict[str, Optional[GradList]] = {
-            k: None for k in self.loss_fns
+        self.prev_accumulators: Dict[str, GradList] = {
+            k: [torch.zeros_like(p, dtype=torch.bfloat16) for p in self.grad_params]
+            for k in self.loss_fns
         }
         self.norm_moving_averages: Dict[str, float] = { 
             k: 1.0 for k in self.loss_fns                   # Initialize with 1.0 for stability
@@ -202,6 +216,35 @@ class GradientConductor:
         for t in g:
             acc += torch.sum(t.float().pow(2))
         return acc
+
+    def _get_effective_alpha(
+        self,
+        cosine_sim: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Computes the 'effective' conflict angle using a non-linear remapping
+        based on cosine similarity thresholds.
+        """
+        c = cosine_sim.clamp(-1.0, 1.0)
+        t_crit, _, t_weak = self.conflict_thresholds
+
+        pi_half = torch.tensor(torch.pi / 2.0, device=c.device)
+
+        if c >= t_weak:
+            # Normalize c from its actual range [t_weak, 1.0] to t in [0, 1]
+            t = (c - t_weak) / (1.0 - t_weak + self.eps)
+            # Map t [0, 1] to angle [pi/2, 0]
+            return pi_half * (1.0 - t)
+        elif c > t_crit:
+            # Stretches cosine [-0.75, 0] to angle [pi, pi/2] with non-linearity
+            # 1. Normalize c to t in [0, 1] for this interval
+            t = (c - t_weak) / (t_crit - t_weak)
+            # 2. Apply power for non-linearity
+            t_powered = t.pow(self.remap_power)
+            # 3. Interpolate angle
+            return pi_half + pi_half * t_powered
+        else: # c <= t_crit
+            return torch.tensor(torch.pi, device=c.device)
 
     # --- Core Logic ---
     def _accumulate_for_loss(
@@ -253,7 +296,7 @@ class GradientConductor:
 
         for t_acc, g in zip(self.accumulators[key], grads):
             if g is not None:
-                t_acc.add_(g.detach().to(torch.float32))
+                t_acc.add_(g.detach().to(torch.bfloat16))
         return loss.item()
 
     def _resolve_conflict(
@@ -345,17 +388,13 @@ class GradientConductor:
         norm_j = self._norm_sq(g_j).sqrt()
 
         # 2a. Stability Score (cosine similarity with its own previous gradient)
-        stability_i = torch.tensor(0.0, device=self.device)
-        if self.prev_accumulators.get(name_i):
-            dot_prev = self._dot(g_i, self.prev_accumulators[name_i])
-            norm_prev_i = self._norm_sq(self.prev_accumulators[name_i]).sqrt()
-            stability_i = dot_prev / (norm_i * norm_prev_i + self.eps)
+        dot_prev = self._dot(g_i, self.prev_accumulators[name_i])
+        norm_prev_i = self._norm_sq(self.prev_accumulators[name_i]).sqrt()
+        stability_i = dot_prev / (norm_i * norm_prev_i + self.eps)
 
-        stability_j = torch.tensor(0.0, device=self.device)
-        if self.prev_accumulators.get(name_j):
-            dot_prev = self._dot(g_j, self.prev_accumulators[name_j])
-            norm_prev_j = self._norm_sq(self.prev_accumulators[name_j]).sqrt()
-            stability_j = dot_prev / (norm_j * norm_prev_j + self.eps)
+        dot_prev = self._dot(g_j, self.prev_accumulators[name_j])
+        norm_prev_j = self._norm_sq(self.prev_accumulators[name_j]).sqrt()
+        stability_j = dot_prev / (norm_j * norm_prev_j + self.eps)
 
         # 2b. Strength Score (gradient norm relative to its moving average)
         scaled_norm_i = norm_i / (norm_emas[name_i] + self.eps)
@@ -377,8 +416,8 @@ class GradientConductor:
 
     def _project(self) -> Tuple[GradList, Dict[str, float]]:
         """
-        Iteratively finds and resolves conflicts between gradients until all
-        cosine similarities are non-negative or the iteration limit is reached.
+        Resolves conflicts between gradients and returns the final unified gradient.
+        Can use either the original iterative 4-zone logic or the new smooth logic.
         """
         stats = {"proj_iters": 0.0, "min_cosine_sim": 1.0} # 1.0 indicates perfect agreement
         if len(self.loss_fns) <= 1:
@@ -387,7 +426,7 @@ class GradientConductor:
             stats[f'raw_norm/{key}'] = self._norm_sq(grad_list).sqrt().item()
             return grad_list, stats
 
-        grads = {k: [t.clone() for t in v] for k, v in self.accumulators.items()}
+        grads = self.accumulators
         for name, grad_list in grads.items():
             raw_norm = self._norm_sq(grad_list).sqrt()
             stats[f'raw_norm/{name}'] = raw_norm.item()
@@ -406,7 +445,7 @@ class GradientConductor:
                         t.mul_(clip_coef)
 
         grad_names = list(grads.keys())
-        crit_thresh, main_thresh, weak_thresh = self.conflict_thresholds
+        crit_thresh, _, weak_thresh = self.conflict_thresholds
         
         # A reasonable default for max_iters to prevent potential infinite loops.
         for iter_num in range(self.max_iters or len(grad_names) * 2):
@@ -431,30 +470,78 @@ class GradientConductor:
                     
                     if cosine < min_cosine_sim:
                         min_cosine_sim = cosine
-                        conflict_pair = (grad_names[i], grad_names[j])
+                        conflict_pair = (grad_names[i], grad_names[j], dot, norm_i_sq, norm_j_sq)
             
-            # --- If the most acute angle is already in the agreement zone, we can exit early ---
-            if conflict_pair is None:
+            # If the most severe conflict found is actually an agreement, we can stop.
+            if conflict_pair is None or min_cosine_sim >= weak_thresh:
                 break
             
             if iter_num == 0:
                 stats['min_cosine_sim'] = min_cosine_sim.item()
             stats['proj_iters'] = float(iter_num + 1)
 
-            # Resolve the most significant conflict found in this iteration
-            self._resolve_conflict(
-                conflict_pair[0], 
-                conflict_pair[1], 
-                grads, 
-                min_cosine_sim,  # Pass the pre-computed cosine
-                self.norm_moving_averages
-            )
+            # Unpack the conflicting pair's data
+            name_i, name_j, dot, norm_i_sq, norm_j_sq = conflict_pair
+
+            # --- SELECT CONFLICT RESOLUTION STRATEGY ---
+            if not self.use_smooth_logic:
+                # --- STRATEGY 1: Original 4-zone step-logic ---
+                self._resolve_conflict(
+                    name_i, 
+                    name_j, 
+                    grads, 
+                    min_cosine_sim,
+                    self.norm_moving_averages
+                )
+            else:
+                # --- STRATEGY 2: New smooth, remapped logic ---
+                # 1. Determine winner/loser using the existing arbitrator
+                g_i, g_j = grads[name_i], grads[name_j]
+                winner_name, loser_name = self._run_arbitrator(
+                    name_i, name_j, g_i, g_j, self.norm_moving_averages
+                )
+
+                # 2. Assign gradients and norms according to winner/loser roles
+                if winner_name == name_i:
+                    g_w, g_l, n_w_sq, n_l_sq = g_i, g_j, norm_i_sq, norm_j_sq
+                else:
+                    g_w, g_l, n_w_sq, n_l_sq = g_j, g_i, norm_j_sq, norm_i_sq
+
+                # 3. Get effective angle and scaling factors for modulation
+                alpha_eff = self._get_effective_alpha(min_cosine_sim)
+                s_w = torch.sin(alpha_eff)
+                pi_half = torch.tensor(torch.pi / 2.0, device=alpha_eff.device)
+                s_l = torch.sin(torch.minimum(alpha_eff, pi_half))
+
+                # 4. Apply scaled projection update, avoiding sequential dependencies.
+                # Pre-calculate final alphas for the update operations
+                alpha_w = -s_w * (dot / (n_l_sq + self.eps))
+                alpha_l = -s_l * (dot / (n_w_sq + self.eps))
+
+                for p_w, p_l in zip(g_w, g_l):
+                    # First, calculate both update vectors based on original tensors
+                    update_for_winner = p_l.mul(alpha_w)
+                    update_for_loser = p_w.mul(alpha_l)
+
+                    # Then, apply both updates in-place
+                    p_w.add_(update_for_winner)
+                    p_l.add_(update_for_loser)
 
         # Final aggregation of resolved gradients
-        final_grads = [torch.zeros_like(p, dtype=torch.float32) for p in self.grad_params]
-        for grad_list in grads.values():
-            for i, grad_tensor in enumerate(grad_list):
-                final_grads[i].add_(grad_tensor)
+        grad_names = list(grads.keys())
+
+        # If there are no gradients, return an empty list
+        if not grad_names:
+            return [torch.zeros_like(p) for p in self.grad_params], stats
+
+        # Use the first gradient list as the base for summation.
+        # Convert it to float32 to serve as a high-precision accumulator.
+        final_grads = [g.to(torch.float32) for g in grads[grad_names[0]]]
+
+        # Add the remaining gradient lists to the base list in-place.
+        for name in grad_names[1:]:
+            for final_g, task_g in zip(final_grads, grads[name]):
+                final_g.add_(task_g)  # In-place addition
 
         return final_grads, stats
 
@@ -463,26 +550,25 @@ class GradientConductor:
         self._step_idx += 1
         b = self.beta
         one_minus_b = 1.0 - b
-        scaled = []
+
         with torch.no_grad():
-            for m, g_, p in zip(self.momentum, g, self.grad_params):
+            for i, (m, g_, p) in enumerate(zip(self.momentum, g, self.grad_params)):
                 # 1. EMA
                 m.mul_(b).add_(g_, alpha=one_minus_b)
 
-                # 2. Get the update direction from the updated momentum buffer m.
-                #    (sign for Lion, the momentum vector itself for SGD-style updates)
-                upd = torch.sign(m) if self.use_lion else m
+                # 2. Apply Lion-specific update only if enabled.
+                if self.use_lion:
+                    # Get the update direction (sign of momentum for Lion)
+                    upd = torch.sign(m)
 
-                # 3. Trust-Ratio
-                upd_norm = upd.norm()
-                if upd_norm < 1e-12:     # Guard against division by zero
-                    trust = 1.0
-                else:
-                    trust = (p.detach().norm() /
-                             (upd_norm + self.eps)) * self.trust_ratio_coef
-                scaled.append(upd * trust)
-        # Store the final, scaled update vector to be used by _write_to_model
-        self._out_update = scaled
+                    # 3. Trust-Ratio
+                    upd_norm = upd.norm()
+                    if upd_norm < 1e-12:     # Guard against division by zero
+                        trust = 1.0
+                    else:
+                        trust = (p.detach().norm() /
+                                (upd_norm + self.eps)) * self.trust_ratio_coef
+                    self.final_update[i] = upd * trust
 
     def _write_to_model(self) -> None:
         # Determine the source gradients to write to the model
@@ -490,10 +576,10 @@ class GradientConductor:
             # Use the projected gradients directly without momentum
             src = self._last_safe
         else:
-            # Lion update already contains the scaled sign(m)*trust; no bias-correction needed
-            # For SGD-style momentum, apply bias-correction
-            src = (self._out_update if self.use_lion else
-                   [m / (1.0 - self.beta ** self._step_idx) for m in self.momentum])
+            # For SGD-style momentum, apply bias-correction. This creates a new list
+            # of tensors, which is an acceptable transient allocation required by the algorithm.
+            src = (self.final_update if self.use_lion else
+                [m / (1.0 - self.beta ** self._step_idx) for m in self.momentum])
         for p, g in zip(self.grad_params, src):
             # .detach() ensures no lingering graph dependencies
             p.grad = g.to(dtype=p.dtype).detach()
@@ -540,11 +626,6 @@ class GradientConductor:
                 self.model.train(_orig_training)  # type: ignore[arg-type]
         # 2) The rest can be done without gradient tracking
         with torch.no_grad():
-            # Store the raw gradients BEFORE projection for the next step's stability calculation
-            for name, acc_list in self.accumulators.items():
-                dtype = torch.bfloat16 if self.device.type == "cuda" else torch.float16
-                self.prev_accumulators[name] = [p.clone().to(dtype) for p in acc_list]
-
             safe_grad, proj_stats = self._project()
             self._last_safe = safe_grad
             self._momentum_update(safe_grad)
@@ -555,7 +636,7 @@ class GradientConductor:
                 sync_tensors = (
                     self._last_safe
                     if self.return_raw_grad
-                    else (self._out_update if self.use_lion else self.momentum)
+                    else (self.final_update if self.use_lion else self.momentum)
                 )
                 for t in sync_tensors:
                     torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.SUM)  # type: ignore[attr-defined]
@@ -568,7 +649,7 @@ class GradientConductor:
             if self.return_raw_grad:
                 _g_for_norm = self._last_safe
             elif self.use_lion:
-                _g_for_norm = self._out_update  # type: ignore[arg-type]
+                _g_for_norm = self.final_update
             else:
                 _g_for_norm = self.momentum
 
@@ -584,5 +665,13 @@ class GradientConductor:
 
             for key, value in accumulated_losses.items():
                 final_stats[f'loss/{key}'] = value
+
+            # --- Buffer Swap for Next Iteration ---
+            # Swap accumulators with prev_accumulators. This efficiently moves the raw
+            # gradients from the current step into prev_accumulators for the next
+            # step's stability calculation, without any memory copy.
+            # The current prev_accumulators (which contains old gradients) becomes
+            # the new accumulators, and will be zeroed out at the start of the next step.
+            self.accumulators, self.prev_accumulators = self.prev_accumulators, self.accumulators
             
             return final_stats

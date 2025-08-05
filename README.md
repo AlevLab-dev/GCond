@@ -6,11 +6,11 @@ The core idea is to analyze and resolve conflicts between gradients from differe
 
 ## Key Features
 
-  * **Conflict-Aware Gradient Merging**: Instead of simply summing gradients, it uses cosine similarity to detect and resolve conflicts between different loss gradients. It employs a multi-zone strategy, from symmetric projection for weak conflicts to a winner-takes-all approach for critical ones.
-  * **Adaptive Arbitrator**: When gradients are in direct opposition, an arbitrator decides the "winner" based on a hybrid score of training stability and relative gradient strength.
+  * **Smooth Conflict Resolution**: By default, GradientConductor no longer uses discrete zones for conflict resolution. Instead, it employs a continuous, angle-based projection. It calculates an "effective conflict angle" from the cosine similarity and non-linearly remaps it to determine the projection strength. This allows for a more nuanced gradient modification, smoothly transitioning from minor adjustments for weak disagreements to strong corrections for severe conflicts. The legacy multi-zone logic is still available via a flag.
+  * **Adaptive Arbitrator**: When gradients are in significant opposition, an arbitrator module decides the "winner". This decision is based on a hybrid score of training stability (consistency with previous gradients) and relative strength (norm compared to its moving average). The arbitrator's choice guides both the legacy winner-takes-all logic and the new smooth projection mechanism.
   * **Integrated Momentum & Trust-Ratio**: It manages its own momentum update, optionally replacing the optimizer's first moment (`beta1` in Adam). It can also apply a trust-ratio scaling (similar to LARS/LAMB) for more stable updates.
   * **Optimizer-Agnostic**: Works seamlessly with any external optimizer. You compute the gradient with `Conductor`, and the optimizer just applies it.
-  * **Efficient Implementation**: Built on `torch.func.functional_call` for memory and speed efficiency, avoiding expensive `state_dict` copying and correctly handling batch normalization during gradient computation.
+  * **Efficient Implementation**: Built on torch.func.functional_call for speed and memory efficiency. It avoids state_dict copying and uses a zero-copy buffer swap for historical gradients, ensuring correct and fast operation even with large accumulation steps.
 
 ## Installation
 
@@ -141,18 +141,24 @@ Here is a brief overview of the key parameters for the `GradientConductor` class
 * `accumulation_steps` (`int`): The number of batches to accumulate gradients over before performing an update.
 
 ### Conflict Resolution
+* `use_smooth_logic` (`bool`, default: `True`): Enables the new smooth, angle-based conflict resolution. When `False`, reverts to the legacy multi-zone strategy (PCGrad, winner-takes-all).
+* `remap_power` (`float`, default: `2.0`): The power used for non-linear remapping of cosine similarity to a conflict angle in smooth mode. Higher values create a more aggressive response to conflicts.
 * `projection_max_iters` (`Optional[int]`): The maximum number of iterations to resolve gradient conflicts. Defaults to a reasonable value if not set.
-* `conflict_thresholds` (`Tuple[float, float, float]`): A tuple of three cosine similarity values `(critical, main, weak)` that define the conflict zones. Must be in non-decreasing order (e.g., `(-0.75, -0.5, 0.0)`).
+* `conflict_thresholds` (`Tuple[float, float, float]`, default: `(-0.85, -0.5, 0)`): A tuple of cosine similarity values `(critical, main, weak)`. Their role depends on `use_smooth_logic`:
+    * In **smooth mode** (default), they define the curve for remapping cosine similarity to a conflict angle. `weak` is where resolution begins, and `critical` is where it saturates.
+    * In **legacy mode**, they define the sharp boundaries for the conflict zones.
 * `dominance_window` (`int`): The number of recent steps to check for task dominance. A task that "wins" conflicts for this many steps in a row will automatically win the next conflict. Set to `0` to disable.
-* `tie_breaking_weights` (`Tuple[float, float]`): The weights `(stability, strength)` used by the arbitrator to break ties when no task is dominant.
+* `tie_breaking_weights` (`Tuple[float, float]`): The weights `(stability, strength)` used by the arbitrator to break ties. Stability is the cosine similarity with the task's own previous gradient. Strength is the task's current gradient norm relative to its moving average.
 
 ### Gradient Normalization and Updates
 * `norm_cap` (`Optional[float]`): An optional value to cap the L2 norm of each raw gradient *before* conflict resolution.
+* `norm_ema_beta` (`float`, default: `0.95`): The beta coefficient for the Exponential Moving Average of each task's gradient norm. This is used to calculate the "strength" score in the arbitrator.
 * `momentum_beta` (`float`): The momentum coefficient (like `beta1` in Adam). This replaces the optimizer's momentum.
-* `use_lion` (`bool`): If `True`, uses a Lion-style update (`sign(momentum)`). If `False`, uses a standard momentum update.
+* `use_lion` (`bool`, default: `True`): If `True`, uses a Lion-style update which takes the `sign()` of the momentum. If `False`, uses the standard momentum value for the update.
 * `trust_ratio_coef` (`float`): The coefficient for trust-ratio scaling, which adapts the update size based on the ratio of parameter norm to update norm.
 
 ### Technical Parameters
 * `return_raw_grad` (`bool`): If `True`, the final gradient written to `p.grad` will be the projected gradient *without* the momentum update.
 * `freeze_bn` (`bool`): If `True`, automatically sets BatchNorm layers to `eval()` mode during gradient accumulation for deterministic behavior.
+* `ddp_sync` (`Literal["avg", "broadcast", "none"]`, default: `"avg"`): Controls gradient synchronization when using `DistributedDataParallel`. `"avg"` syncs and averages gradients across ranks, `"broadcast"` sums them, and `"none"` disables automatic syncing.
 * `eps` (`float`): A small epsilon value to prevent division by zero in normalization calculations.
