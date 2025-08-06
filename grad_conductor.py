@@ -1,4 +1,4 @@
-# gcond/grad_conductor.py
+# GCond/grad_conductor.py
 from __future__ import annotations
 
 import contextlib
@@ -65,13 +65,14 @@ class GradientConductor:
         model: nn.Module,
         loss_fns: Dict[str, Callable[[torch.Tensor, torch.Tensor], torch.Tensor]],
         lambdas: Dict[str, float],
-        accumulation_steps: int,
+        accumulation_steps: int, # should be divisible by the number of loss functions
         *,
         projection_max_iters: Optional[int] = None,
         norm_cap: Optional[float] = None,
         momentum_beta: float = 0.85,
-        use_lion: bool = True,              # Enables Lion-style update
-        trust_ratio_coef: float = 0.004,    # LARS/LAMB trust ratio coefficient
+        use_lion: bool = False,              # Enables Lion-style update
+        trust_ratio_coef: float = 1e-4,    # LARS/LAMB trust ratio coefficient
+        trust_ratio_clip: float = 100.0,
         dominance_window: int = 3,
         conflict_thresholds: Tuple[float, float, float] = (-0.85, -0.5, 0), # (critical, main, weak) thresholds
         norm_ema_beta: float = 0.95,
@@ -79,6 +80,7 @@ class GradientConductor:
         return_raw_grad: bool = False,
         remap_power: float = 2.0,           # Power for non-linear angle remapping
         use_smooth_logic: bool = True,      # Use the new smooth conflict resolution
+        stochastic_accumulation: bool = False, # Use sequential loss calculation
         ddp_sync: Literal["avg", "broadcast", "none"] = "avg",
         freeze_bn: bool = True,
         eps: float = 1e-8,
@@ -92,13 +94,13 @@ class GradientConductor:
             raise RuntimeError(
                 "GradientConductor now requires PyTorch ≥ 2.0 with torch.func"
             )
+        
 
         self.model = model
         self.loss_fns = loss_fns
         self.lambdas = {k: float(v) for k, v in lambdas.items()}
         self.acc_steps = accumulation_steps
 
-        #self.projection_mode = projection_mode
         self.max_iters = projection_max_iters
         self.norm_cap = norm_cap
 
@@ -111,11 +113,14 @@ class GradientConductor:
         if trust_ratio_coef <= 0:
             raise ValueError("trust_ratio_coef must be > 0")
         self.trust_ratio_coef = float(trust_ratio_coef)
+        self.trust_ratio_clip = trust_ratio_clip
 
         if remap_power <= 0:
             raise ValueError("remap_power must be positive.")
         self.remap_power = float(remap_power)
         self.use_smooth_logic = bool(use_smooth_logic)
+        self.stochastic_accumulation = bool(stochastic_accumulation)
+
     
         if not (0.0 <= norm_ema_beta < 1.0):
             raise ValueError("norm_ema_beta must be in [0, 1).")
@@ -252,6 +257,7 @@ class GradientConductor:
         key: str,
         x: torch.Tensor,
         y: torch.Tensor,
+        normalization_factor: float,
     ) -> float:
         params = _named_trainable_params(
             self.model.module if self.is_ddp else self.model
@@ -280,7 +286,7 @@ class GradientConductor:
                 loss = (
                     self.loss_fns[key](out, y)
                     * self.lambdas[key]
-                    / self.acc_steps
+                    / normalization_factor  
                 )
                 return loss
 
@@ -551,24 +557,46 @@ class GradientConductor:
         b = self.beta
         one_minus_b = 1.0 - b
 
+        # Adam-style bias correction factor
+        bias_correction = 1.0 - b ** self._step_idx
+
         with torch.no_grad():
             for i, (m, g_, p) in enumerate(zip(self.momentum, g, self.grad_params)):
-                # 1. EMA
+                # 1. Update the moving average (momentum) - no change here
                 m.mul_(b).add_(g_, alpha=one_minus_b)
 
-                # 2. Apply Lion-specific update only if enabled.
                 if self.use_lion:
-                    # Get the update direction (sign of momentum for Lion)
-                    upd = torch.sign(m)
+                    # --- IMPROVED LION + LARS LOGIC ---
 
-                    # 3. Trust-Ratio
-                    upd_norm = upd.norm()
-                    if upd_norm < 1e-12:     # Guard against division by zero
-                        trust = 1.0
+                    # 2. Apply bias correction to the momentum. This is crucial
+                    # for stabilizing direction and magnitude in early steps.
+                    m_corrected = m / bias_correction
+                    
+                    # 3. Get update direction from the corrected momentum (Lion-style)
+                    update_direction = torch.sign(m_corrected)
+
+                    # 4. Adaptive learning rate in LARS style (CORRECTED LOGIC)
+                    p_norm = p.detach().norm()
+                    # Use the norm of the CORRECTED momentum, not sign(m)
+                    m_corrected_norm = m_corrected.norm()
+
+                    # Calculate the trust ratio
+                    if m_corrected_norm < self.eps or p_norm < self.eps:
+                        trust_ratio = torch.tensor(1.0, device=p.device)
                     else:
-                        trust = (p.detach().norm() /
-                                (upd_norm + self.eps)) * self.trust_ratio_coef
-                    self.final_update[i] = upd * trust
+                        trust_ratio = p_norm / m_corrected_norm
+
+                    trust_ratio = torch.clamp(trust_ratio, max=self.trust_ratio_clip)
+                    
+                    # Final update step: Direction * Adaptive LR * Base LR
+                    learning_rate = trust_ratio * self.trust_ratio_coef
+                    self.final_update[i] = update_direction * learning_rate
+                
+                else:
+                    # --- STANDARD MOMENTUM (SGD-style) LOGIC ---
+                    # Apply bias correction and write to final_update for unification
+                    # and efficiency.
+                    self.final_update[i] = m / bias_correction
 
     def _write_to_model(self) -> None:
         # Determine the source gradients to write to the model
@@ -576,10 +604,10 @@ class GradientConductor:
             # Use the projected gradients directly without momentum
             src = self._last_safe
         else:
-            # For SGD-style momentum, apply bias-correction. This creates a new list
-            # of tensors, which is an acceptable transient allocation required by the algorithm.
-            src = (self.final_update if self.use_lion else
-                [m / (1.0 - self.beta ** self._step_idx) for m in self.momentum])
+            # Now, self.final_update holds the correct result for both modes
+            # (Lion+LARS and standard momentum with bias correction).
+            src = self.final_update
+
         for p, g in zip(self.grad_params, src):
             # .detach() ensures no lingering graph dependencies
             p.grad = g.to(dtype=p.dtype).detach()
@@ -612,14 +640,34 @@ class GradientConductor:
                 self.model.eval()
 
             with torch.enable_grad():
-                for _ in range(self.acc_steps):
-                    x, y = data_provider()
-                    # x and y are assumed to be on the correct device, as handled
-                    # by the data_provider
+                if self.stochastic_accumulation:
+                    loss_keys = list(self.loss_fns.keys())
+                    num_losses = len(loss_keys)
 
-                    for key in self.loss_fns:
-                        loss_value = self._accumulate_for_loss(key, x, y)
-                        accumulated_losses[key] += loss_value
+                    if num_losses == 0:
+                        steps_per_loss = self.acc_steps
+                    else:
+                        if self.acc_steps % num_losses != 0:
+                            raise ValueError(
+                                f"In stochastic mode, accumulation_steps ({self.acc_steps}) "
+                                f"must be divisible by the number of loss fns ({num_losses})."
+                            )
+                        steps_per_loss = self.acc_steps // num_losses
+
+                    for key in loss_keys:
+                        if steps_per_loss == 0:
+                            continue
+                        for _ in range(steps_per_loss):
+                            x, y = data_provider()
+                            loss_value = self._accumulate_for_loss(key, x, y, float(steps_per_loss))
+                            accumulated_losses[key] += loss_value
+                else:
+                    for _ in range(self.acc_steps):
+                        x, y = data_provider()
+                        for key in self.loss_fns:
+                            loss_value = self._accumulate_for_loss(key, x, y, float(self.acc_steps))
+                            accumulated_losses[key] += loss_value
+
         finally:
             if self.freeze_bn_flag:
                 # Restore the model's original training mode
@@ -632,11 +680,8 @@ class GradientConductor:
 
             # --- DDP Synchronization (if enabled) ---
             if self.is_ddp and self.ddp_sync_mode != "none":
-                # Sync the exact tensors that will be written to p.grad
                 sync_tensors = (
-                    self._last_safe
-                    if self.return_raw_grad
-                    else (self.final_update if self.use_lion else self.momentum)
+                    self._last_safe if self.return_raw_grad else self.final_update
                 )
                 for t in sync_tensors:
                     torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.SUM)  # type: ignore[attr-defined]
@@ -646,13 +691,7 @@ class GradientConductor:
             self._write_to_model()
 
             # Calculate the norm of the actual gradient being applied
-            if self.return_raw_grad:
-                _g_for_norm = self._last_safe
-            elif self.use_lion:
-                _g_for_norm = self.final_update
-            else:
-                _g_for_norm = self.momentum
-
+            _g_for_norm = self._last_safe if self.return_raw_grad else self.final_update
             final_grad_norm = math.sqrt(self._norm_sq(_g_for_norm).item())
             
             # Aggregate all statistics into a single dictionary
@@ -675,3 +714,53 @@ class GradientConductor:
             self.accumulators, self.prev_accumulators = self.prev_accumulators, self.accumulators
             
             return final_stats
+
+    def state_dict(self) -> Dict[str, any]:
+        """
+        Returns a state dictionary containing all essential buffers and variables
+        for checkpointing.
+
+        The dictionary includes momentum buffers, previous step's gradients,
+        norm moving averages, projection history, and the internal step counter.
+        """
+        return {
+            "momentum": self.momentum,
+            "prev_accumulators": self.prev_accumulators,
+            "norm_moving_averages": self.norm_moving_averages,
+            "projection_history": list(self.projection_history),
+            "_step_idx": self._step_idx,
+        }
+    
+    def load_state_dict(self, state_dict: Dict[str, any]) -> None:
+        """
+        Loads the conductor's state from a state dictionary.
+
+        Args:
+            state_dict (Dict[str, any]): A dictionary containing the state to load,
+                typically obtained from a call to `state_dict()`.
+        """
+        # 1. Restore Tensors (momentum and prev_accumulators)
+        # Use .copy_ to load in-place, which correctly handles device placement.
+        for i, p in enumerate(state_dict["momentum"]):
+            self.momentum[i].copy_(p.to(self.device))
+
+        for key, grad_list in state_dict["prev_accumulators"].items():
+            if key in self.prev_accumulators:
+                for i, p in enumerate(grad_list):
+                    self.prev_accumulators[key][i].copy_(p.to(self.device))
+
+        # 2. Restore non-tensor state
+        self.norm_moving_averages = state_dict["norm_moving_averages"]
+        self._step_idx = state_dict["_step_idx"]
+
+        # 3. Restore the deque with the correct maxlen from the current config
+        self.projection_history = deque(
+            state_dict["projection_history"], maxlen=self.dominance_window
+        )
+
+        # 4. For consistency, zero out the current accumulators, as they
+        # would be at the start of a `step`.
+        with torch.no_grad():
+            for v in self.accumulators.values():
+                for t in v:
+                    t.zero_()

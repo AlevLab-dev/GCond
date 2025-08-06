@@ -154,7 +154,7 @@ Here is a brief overview of the key parameters for the `GradientConductor` class
 * `norm_cap` (`Optional[float]`): An optional value to cap the L2 norm of each raw gradient *before* conflict resolution.
 * `norm_ema_beta` (`float`, default: `0.95`): The beta coefficient for the Exponential Moving Average of each task's gradient norm. This is used to calculate the "strength" score in the arbitrator.
 * `momentum_beta` (`float`): The momentum coefficient (like `beta1` in Adam). This replaces the optimizer's momentum.
-* `use_lion` (`bool`, default: `True`): If `True`, uses a Lion-style update which takes the `sign()` of the momentum. If `False`, uses the standard momentum value for the update.
+* `use_lion` (`bool`, default: `False`): If `True`, uses a Lion-style update which takes the `sign()` of the momentum. If `False`, uses the standard momentum value for the update.
 * `trust_ratio_coef` (`float`): The coefficient for trust-ratio scaling, which adapts the update size based on the ratio of parameter norm to update norm.
 
 ### Technical Parameters
@@ -162,3 +162,11 @@ Here is a brief overview of the key parameters for the `GradientConductor` class
 * `freeze_bn` (`bool`): If `True`, automatically sets BatchNorm layers to `eval()` mode during gradient accumulation for deterministic behavior.
 * `ddp_sync` (`Literal["avg", "broadcast", "none"]`, default: `"avg"`): Controls gradient synchronization when using `DistributedDataParallel`. `"avg"` syncs and averages gradients across ranks, `"broadcast"` sums them, and `"none"` disables automatic syncing.
 * `eps` (`float`): A small epsilon value to prevent division by zero in normalization calculations.
+* `stochastic_accumulation` (`bool`, default: `False`): If `True`, enables a stochastic accumulation mode. Instead of computing all loss gradients for every batch within the accumulation cycle, it processes each loss function sequentially. This method can dramatically increase training speed, especially with large effective batch sizes, by reducing the computational load per step. Experimentally, the final training outcome is shown to be nearly identical to the standard method due to the statistical significance of data at scale. Important: When enabled, `accumulation_steps` must be divisible by the number of loss functions.
+
+## Checkpointing
+
+The conductor maintains its own internal state, which is crucial for resuming training.
+
+* `conductor.state_dict() -> Dict`: Returns a dictionary containing the entire state of the conductor, including momentum buffers, historical gradients, norm moving averages, and the projection history.
+* `conductor.load_state_dict(state_dict: Dict) -> None`: Loads the conductor's state from a dictionary. It's important to call this *after* loading your model's state, as the conductor's buffers are tied to the model's device.
