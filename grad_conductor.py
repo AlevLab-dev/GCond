@@ -74,13 +74,13 @@ class GradientConductor:
         trust_ratio_coef: float = 1e-4,    # LARS/LAMB trust ratio coefficient
         trust_ratio_clip: float = 100.0,
         dominance_window: int = 3,
-        conflict_thresholds: Tuple[float, float, float] = (-0.85, -0.5, 0), # (critical, main, weak) thresholds
+        conflict_thresholds: Tuple[float, float, float] = (-0.8, -0.5, 0), # (critical, main, weak) thresholds
         norm_ema_beta: float = 0.95,
         tie_breaking_weights: Tuple[float, float] = (0.8, 0.2), # (stability, strength) - Tie-breaking weights
         return_raw_grad: bool = False,
         remap_power: float = 2.0,           # Power for non-linear angle remapping
         use_smooth_logic: bool = True,      # Use the new smooth conflict resolution
-        stochastic_accumulation: bool = False, # Use sequential loss calculation
+        stochastic_accumulation: bool = True, # or sequential loss calculation
         ddp_sync: Literal["avg", "broadcast", "none"] = "avg",
         freeze_bn: bool = True,
         eps: float = 1e-8,
@@ -385,9 +385,9 @@ class GradientConductor:
                         self.projection_history.count(name_j) == self.dominance_window)
         
         if is_i_dominant and not is_j_dominant:
-            return name_i, name_j
-        if is_j_dominant and not is_i_dominant:
             return name_j, name_i
+        if is_j_dominant and not is_i_dominant:
+            return name_i, name_j
 
         # 2. Tie-Breaking via Hybrid Score (if no dominance is established)
         norm_i = self._norm_sq(g_i).sqrt()
@@ -506,6 +506,8 @@ class GradientConductor:
                 winner_name, loser_name = self._run_arbitrator(
                     name_i, name_j, g_i, g_j, self.norm_moving_averages
                 )
+                if self.dominance_window > 0:
+                    self.projection_history.append(winner_name)
 
                 # 2. Assign gradients and norms according to winner/loser roles
                 if winner_name == name_i:
