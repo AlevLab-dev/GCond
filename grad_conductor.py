@@ -231,19 +231,20 @@ class GradientConductor:
         based on cosine similarity thresholds.
         """
         c = cosine_sim.clamp(-1.0, 1.0)
-        t_crit, _, t_weak = self.conflict_thresholds
+        t_crit, t_main, t_weak = self.conflict_thresholds
 
         pi_half = torch.tensor(torch.pi / 2.0, device=c.device)
 
-        if c >= t_weak:
-            # Normalize c from its actual range [t_weak, 1.0] to t in [0, 1]
-            t = (c - t_weak) / (1.0 - t_weak + self.eps)
+        if c >= t_main:
+            # Normalize c from its actual range [t_main, t_weak] to t in [0, 1]
+            t = (c - t_main) / (t_weak - t_main + self.eps)
+            t = t.clamp(0.0, 1.0)
             # Map t [0, 1] to angle [pi/2, 0]
             return pi_half * (1.0 - t)
         elif c > t_crit:
             # Stretches cosine [-0.75, 0] to angle [pi, pi/2] with non-linearity
             # 1. Normalize c to t in [0, 1] for this interval
-            t = (c - t_weak) / (t_crit - t_weak)
+            t = (c - t_main) / (t_crit - t_main + self.eps)
             # 2. Apply power for non-linearity
             t_powered = t.pow(self.remap_power)
             # 3. Interpolate angle
