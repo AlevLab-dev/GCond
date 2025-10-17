@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import contextlib
 import math
-from typing import Callable, Dict, List, Literal, Optional, Tuple
+from typing import Callable, Dict, List, Literal, Optional, Tuple, Any
 from collections import deque
 
 import torch
@@ -18,7 +18,7 @@ except ImportError:
 
 # --- Type Aliases ---
 GradList = List[torch.Tensor]
-DataProvider = Callable[[], Tuple[torch.Tensor, torch.Tensor]]
+DataProvider = Callable[[], Tuple[Any, Any]]
 
 # --- Helper Components ---
 def _named_trainable_params(module: nn.Module) -> Dict[str, torch.Tensor]:
@@ -63,7 +63,7 @@ class GradientConductor:
     def __init__(
         self,
         model: nn.Module,
-        loss_fns: Dict[str, Callable[[torch.Tensor, torch.Tensor], torch.Tensor]],
+        loss_fns: Dict[str, Callable[..., torch.Tensor]],
         lambdas: Dict[str, float],
         accumulation_steps: int, # should be divisible by the number of loss functions
         *,
@@ -256,8 +256,8 @@ class GradientConductor:
     def _accumulate_for_loss(
         self,
         key: str,
-        x: torch.Tensor,
-        y: torch.Tensor,
+        x: Any,
+        y: Any,
         normalization_factor: float,
     ) -> float:
         params = _named_trainable_params(
@@ -279,13 +279,35 @@ class GradientConductor:
         ):
             def _forward(*flat_params: torch.Tensor) -> torch.Tensor:
                 param_dict = dict(zip(param_names, flat_params))
+                model_args = ()
+                model_kwargs = {}
+                if isinstance(x, dict) and ('args' in x or 'kwargs' in x):
+                    # x = {'args': (...), 'kwargs': {...}}
+                    model_args = x.get('args', ())
+                    model_kwargs = x.get('kwargs', {})
+                elif isinstance(x, (tuple, list)):
+                    # x = (arg1, arg2, ...)
+                    model_args = tuple(x)
+                else:
+                    # x = Tensor
+                    model_args = (x,)
                 out = functional_call(
                     self.model.module if self.is_ddp else self.model,
                     (param_dict, buffers),
-                    (x,),
+                    args=model_args,
+                    kwargs=model_kwargs
                 )
+                loss_args = ()
+                loss_kwargs = {}
+                if isinstance(y, dict) and ('args' in y or 'kwargs' in y):
+                    # y = {'args': (...), 'kwargs': {...}}
+                    loss_args = (out,) + y.get('args', ())
+                    loss_kwargs = y.get('kwargs', {})
+                else:
+                    loss_args = (out, y)
+                    
                 loss = (
-                    self.loss_fns[key](out, y)
+                    self.loss_fns[key](*loss_args, **loss_kwargs)
                     * self.lambdas[key]
                     / normalization_factor  
                 )
